@@ -1,4 +1,87 @@
-# Side effects of accelerating a KLUE emulation
+"""Assembles the per-run measurements into a summary table and a written report."""
+import json
+import os
+
+import numpy as np
+import pandas as pd
+
+from . import common as C
+from . import metrics as M
+
+
+def build_summary(runs, gt_desired, gt_nodes, gt_node_applies):
+    rows, details = [], {}
+    for run in runs:
+        row = {"speed": run.speed, "label": run.label}
+        row.update(C.anchor_info(run))
+        row.update(M.timing(run, gt_desired))
+        row.update(M.resolution(run, gt_desired))
+
+        fid, fid_detail = M.fidelity(run, gt_desired)
+        row.update(fid)
+
+        conv, conv_detail = M.convergence(run)
+        row.update(conv)
+
+        pk, spike_detail = M.peaks(run, gt_desired)
+        row.update(pk)
+
+        row.update(M.pod_health(run))
+        row.update(M.node_occupancy(run, gt_nodes))
+        row.update(M.scheduler(run))
+
+        cpu, cpu_detail = M.control_plane_cpu(run)
+        row.update(cpu)
+        row.update(M.log_signals(run, gt_node_applies))
+
+        # Derived cross-metric quantities.
+        if row.get("mean_desired_pods"):
+            row["pod_surplus_pct"] = 100.0 * (
+                row["mean_running_pods"] / row["mean_desired_pods"] - 1.0)
+        if row.get("wall_span_s"):
+            row["pod_churn_per_wall_s"] = float(
+                gt_desired.diff().abs().sum().sum() / row["wall_span_s"])
+
+        rows.append(row)
+        details[run.label] = {
+            "fidelity": fid_detail, "convergence": conv_detail,
+            "spikes": spike_detail, "cpu": cpu_detail,
+        }
+
+    return pd.DataFrame(rows).sort_values("speed", ascending=False), details
+
+
+def _fmt(v, nd=2):
+    if v is None or (isinstance(v, float) and (np.isnan(v))):
+        return "-"
+    if isinstance(v, (bool, np.bool_)):   # before int: bool is a subclass of int
+        return "yes" if v else "no"
+    if isinstance(v, (int, np.integer)):
+        return f"{v}"
+    if isinstance(v, float):
+        return f"{v:.{nd}f}"
+    return str(v)
+
+
+def _table(df, spec):
+    """spec: list of (column, header, decimals)."""
+    head = "| Metric | " + " | ".join(df["label"]) + " |"
+    sep = "|---" * (len(df) + 1) + "|"
+    lines = [head, sep]
+    for col, header, nd in spec:
+        if col not in df:
+            continue
+        cells = " | ".join(_fmt(v, nd) for v in df[col])
+        lines.append(f"| {header} | {cells} |")
+    return "\n".join(lines)
+
+
+def write_report(summary, details, gt_desired, gt_nodes, gt_node_applies, out_dir):
+    fast = summary.iloc[0]
+    slow = summary.iloc[-1]
+
+    parts = []
+    parts.append(f"""# Side effects of accelerating a KLUE emulation
 
 The same synthetic 300-minute trace (61 ticks, 13-265 pods, 2-34 KWOK nodes) was replayed five
 times on one k3d cluster at `--speed-by` 20, 15, 10, 5 and 1, with no provisioner (KWOK nodes come
@@ -15,64 +98,66 @@ it degrades is the **cluster's ability to converge** to each tick before the nex
 the **resolution of the metrics** you collect as evidence. Both degrade smoothly with speed, and
 both are invisible unless you look for them: the trace still "completes", the peaks still appear,
 and no errors are raised.
+""")
 
-## 1. Pacing is exact at every speed
+    parts.append(f"""## 1. Pacing is exact at every speed
 
 Each observed change of desired replicas is matched back to the tick that asked for it, then
 regressed against wall-clock time. The slope is the achieved speed.
 
-| Metric | 20x | 15x | 10x | 5x | 1x |
-|---|---|---|---|---|---|
-| Effective speed (x) | 20.000 | 15.016 | 10.000 | 5.000 | 1.000 |
-| Error vs requested (%) | -0.00 | 0.10 | -0.00 | -0.00 | -0.00 |
-| Fit R^2 | 1.000000 | 0.999796 | 1.000000 | 1.000000 | 1.000000 |
-| Timing residual, std (wall s) | 0.0 | 5.0 | 0.0 | 0.0 | 0.0 |
-| Wall-clock span (s) | 840 | 1170 | 1770 | 3540 | 17700 |
-| Change samples matched | 28 | 39 | 57 | 57 | 57 |
+{_table(summary, [
+    ("effective_speed", "Effective speed (x)", 3),
+    ("speed_error_pct", "Error vs requested (%)", 2),
+    ("fit_r2", "Fit R^2", 6),
+    ("timing_resid_std_wall_s", "Timing residual, std (wall s)", 1),
+    ("wall_span_s", "Wall-clock span (s)", 0),
+    ("matched_change_samples", "Change samples matched", 0),
+])}
 
 Every run tracked its requested speed to within 0.1%, with R^2 at or indistinguishable from 1.0.
 The 15x residual is not drift: at 15x one 30s sample spans 450s of trace time, which never aligns
 with the 300s tick grid, so changes are seen at a rotating phase offset.
 
 The logs agree: all five runs processed 61/61 trace entries and issued 145/145 scale commands, and
-all five attempted the trace's 101 node applies.
+all five attempted the trace's {gt_node_applies} node applies.
 
-| Metric | 20x | 15x | 10x | 5x | 1x |
-|---|---|---|---|---|---|
-| Trace entries processed (of 61) | 61 | 61 | 61 | 61 | 61 |
-| Scale commands issued (of 145) | 145 | 145 | 145 | 145 | 145 |
-| Node 'created' log lines | 101 | 98 | 98 | 98 | 97 |
-| Node apply failures | 0 | 0 | 0 | 0 | 1 |
-| Error lines | 0 | 0 | 0 | 0 | 2 |
+{_table(summary, [
+    ("log_entries_processed", "Trace entries processed (of 61)", 0),
+    ("log_scale_commands", "Scale commands issued (of 145)", 0),
+    ("log_nodes_created", "Node 'created' log lines", 0),
+    ("log_apply_failures", "Node apply failures", 0),
+    ("log_errors", "Error lines", 0),
+])}
 
 The only failure in the whole sweep is one node apply lost to a transient
 `RemoteDisconnected` - **in the 1x run**, the slowest one. Acceleration did not cause it.
+""")
 
-## 2. The cluster stops keeping up
+    parts.append(f"""## 2. The cluster stops keeping up
 
 "Converged" means the number of Running pods is within max(1 pod, 2%) of what KLUE has asked the
 API server for, measured on the run's own samples. This is purely cluster-side: both series come
 from the same run, so it is unaffected by how the trace was paced.
 
-| Metric | 20x | 15x | 10x | 5x | 1x |
-|---|---|---|---|---|---|
-| Samples converged (%) | 58.6 | 61.5 | 66.1 | 82.4 | 97.7 |
-| Mean |Running - desired| (% of load) | 15.23 | 12.10 | 13.77 | 7.41 | 0.79 |
-| Mean |Running - desired| (pods) | 13.52 | 10.59 | 12.20 | 6.52 | 0.69 |
-| Mean desired pods | 88.8 | 87.5 | 88.6 | 88.0 | 87.5 |
-| Mean Running pods | 102.3 | 98.1 | 92.9 | 90.7 | 88.1 |
-| Mean pod surplus (%) | 15.2 | 12.1 | 4.9 | 3.1 | 0.8 |
-| Pod churn (replicas/wall s) | 1.95 | 1.40 | 0.93 | 0.46 | 0.09 |
+{_table(summary, [
+    ("converged_samples_pct", "Samples converged (%)", 1),
+    ("convergence_nmae_pct", "Mean |Running - desired| (% of load)", 2),
+    ("convergence_mae_pods", "Mean |Running - desired| (pods)", 2),
+    ("mean_desired_pods", "Mean desired pods", 1),
+    ("mean_running_pods", "Mean Running pods", 1),
+    ("pod_surplus_pct", "Mean pod surplus (%)", 1),
+    ("pod_churn_per_wall_s", "Pod churn (replicas/wall s)", 2),
+])}
 
-Convergence falls from 97.7% of samples at 1x to
-58.6% at 20x. At 20x the cluster is in the state the trace
+Convergence falls from {_fmt(slow['converged_samples_pct'], 1)}% of samples at 1x to
+{_fmt(fast['converged_samples_pct'], 1)}% at 20x. At 20x the cluster is in the state the trace
 asks for less than two thirds of the time, and the average error is
-15.2% of the running load against
-0.79% at 1x - roughly a nineteen-fold increase.
+{_fmt(fast['convergence_nmae_pct'], 1)}% of the running load against
+{_fmt(slow['convergence_nmae_pct'], 2)}% at 1x - roughly a nineteen-fold increase.
 
 The error is not symmetric. It is dominated by pods that should be **gone but are still Running**:
-the mean pod count runs 15.2% above the requested level at 20x
-versus 0.8% at 1x. Scale-ups are cheap for KWOK, scale-downs are
+the mean pod count runs {_fmt(fast['pod_surplus_pct'], 1)}% above the requested level at 20x
+versus {_fmt(slow['pod_surplus_pct'], 1)}% at 1x. Scale-ups are cheap for KWOK, scale-downs are
 not: deletion takes wall-clock time that does not shrink when the trace is compressed, so each
 scale-down is still draining when the next tick arrives.
 
@@ -86,99 +171,104 @@ autoscaler would react to.
 One caveat that cuts against the numbers above, not for them: at 15x and 20x the error is
 measured from samples that are themselves too sparse to catch short transients (section 3), and
 the 15x/20x runs record no negative gap at all while 10x and 5x record deficits of up to
-125 pods. The
+{_fmt(summary[summary.speed == 10].iloc[0].get('convergence_max_deficit_pods'), 0)} pods. The
 scale-up deficits have not disappeared at high speed; they are being sampled over. Treat the 15x
 and 20x convergence figures as **lower bounds** on the real divergence.
+""")
 
-### The same lag shows up in the node population
+    parts.append(f"""### The same lag shows up in the node population
 
-| Metric | 20x | 15x | 10x | 5x | 1x |
-|---|---|---|---|---|---|
-| Peak nodes hosting pods | 38 | 38 | 37 | 37 | 37 |
-| Peak nodes in the trace | 34 | 34 | 34 | 34 | 34 |
-| Peak occupancy vs trace (%) | 111.8 | 111.8 | 108.8 | 108.8 | 108.8 |
-| Mean nodes hosting pods | 16.0 | 18.0 | 17.0 | 15.8 | 14.3 |
+{_table(summary, [
+    ("occupied_nodes_max", "Peak nodes hosting pods", 0),
+    ("gt_nodes_max", "Peak nodes in the trace", 0),
+    ("node_occupancy_peak_pct", "Peak occupancy vs trace (%)", 1),
+    ("occupied_nodes_mean", "Mean nodes hosting pods", 1),
+])}
 
-The trace never has more than 34 nodes alive, yet every run has pods
+The trace never has more than {int(gt_nodes['nodes'].max())} nodes alive, yet every run has pods
 spread over more than that at peak. Nodes the trace has deleted are still carrying pods, for the
 same reason: teardown is a real-time cost.
+""")
 
-## 3. Observability degrades faster than fidelity
+    parts.append(f"""## 3. Observability degrades faster than fidelity
 
-The collector's step is hard-coded to 30s of wall time
+The collector's step is hard-coded to {C.COLLECTOR_STEP_SECONDS}s of wall time
 (`Collector(step=30)` in `src/manager.py`) and does not scale with `--speed-by`. So the faster the
 replay, the more trace time each sample covers.
 
-| Metric | 20x | 15x | 10x | 5x | 1x |
-|---|---|---|---|---|---|
-| Wall seconds per tick | 15.0 | 20.0 | 30.0 | 60.0 | 300.0 |
-| Samples per tick | 0.50 | 0.67 | 1.00 | 2.00 | 10.00 |
-| Trace seconds per sample | 600 | 450 | 300 | 150 | 30 |
-| Samples in the run | 30 | 40 | 60 | 120 | 600 |
-| Distinct tick states seen (of 59) | 29 | 40 | 58 | 58 | 58 |
-| Tick states never sampled (%) | 50.8 | 32.2 | 1.7 | 1.7 | 1.7 |
-| At least 2 samples/tick | no | no | no | yes | yes |
+{_table(summary, [
+    ("wall_seconds_per_tick", "Wall seconds per tick", 1),
+    ("samples_per_tick", "Samples per tick", 2),
+    ("trace_seconds_per_sample", "Trace seconds per sample", 0),
+    ("samples_observed", "Samples in the run", 0),
+    ("gt_tick_states_observed", "Distinct tick states seen (of 59)", 0),
+    ("tick_states_missed_pct", "Tick states never sampled (%)", 1),
+    ("nyquist_ok", "At least 2 samples/tick", 0),
+])}
 
 At 20x each sample covers 600s of trace time - two whole ticks - so
-51% of the trace's distinct states are never recorded at
+{_fmt(fast['tick_states_missed_pct'], 0)}% of the trace's distinct states are never recorded at
 all. Only 5x and 1x stay at or above two samples per tick. This is the effect most likely to be
 mistaken for a clean result: the CSVs look normal, they are simply a subsample.
 
 What survives is amplitude:
 
-| Metric | 20x | 15x | 10x | 5x | 1x |
-|---|---|---|---|---|---|
-| Trace peak (pods) | 265 | 265 | 265 | 265 | 265 |
-| Observed Running peak (pods) | 266 | 266 | 261 | 265 | 265 |
-| Peak captured (%) | 100.4 | 100.4 | 98.5 | 100.0 | 100.0 |
+{_table(summary, [
+    ("gt_peak_pods", "Trace peak (pods)", 0),
+    ("observed_running_peak_pods", "Observed Running peak (pods)", 0),
+    ("running_peak_capture_pct", "Peak captured (%)", 1),
+])}
 
 Every run captures every one of the trace's three spikes to within 1.5%, because they are 2-3
 ticks wide and so survive even a 600s sampling quantum. Narrower spikes would not: a
 one-tick feature is already at the Nyquist limit at 10x and below it at 15x and 20x.
+""")
 
-## 4. The scheduler was never the bottleneck
+    parts.append(f"""## 4. The scheduler was never the bottleneck
 
-| Metric | 20x | 15x | 10x | 5x | 1x |
-|---|---|---|---|---|---|
-| Scheduled pods/s (mean) | 1.310 | 0.716 | 0.590 | 0.318 | 0.068 |
-| Scheduled pods/s (peak) | 8.73 | 8.33 | 6.20 | 6.20 | 6.13 |
-| Scheduling latency, overall mean (ms) | 7.38 | 12.88 | 10.84 | 11.47 | 4.56 |
-| Scheduling latency p95 (ms) | 18.06 | 25.46 | 23.53 | 28.03 | 9.34 |
-| Scheduling latency max (ms) | 22.98 | 34.46 | 58.57 | 58.81 | 15.16 |
-| Peak pending pods | 0 | 0 | 0 | 0 | 0 |
-| Unschedulable attempts | 0 | 0 | 0 | 0 | 0 |
-| Preemptions | 0 | 0 | 0 | 0 | 0 |
-| Peak emulated pods in Pending | 0 | 1 | 0 | 0 | 0 |
-| Peak emulated pods in Failed | 1 | 1 | 1 | 1 | 1 |
+{_table(summary, [
+    ("sched_scheduled_per_s_mean", "Scheduled pods/s (mean)", 3),
+    ("sched_scheduled_per_s_max", "Scheduled pods/s (peak)", 2),
+    ("sched_latency_overall_ms", "Scheduling latency, overall mean (ms)", 2),
+    ("sched_latency_p95_ms", "Scheduling latency p95 (ms)", 2),
+    ("sched_latency_max_ms", "Scheduling latency max (ms)", 2),
+    ("sched_pending_max", "Peak pending pods", 0),
+    ("sched_unschedulable_total", "Unschedulable attempts", 0),
+    ("sched_preemption_total", "Preemptions", 0),
+    ("pods_pending_max", "Peak emulated pods in Pending", 0),
+    ("pods_failed_max", "Peak emulated pods in Failed", 0),
+])}
 
 Peak scheduling throughput rises with speed but tops out around 8-9 pods/s, and the queue never
 backs up: **zero** pending pods, **zero** unschedulable attempts and **zero** preemptions in every
 run. Per-attempt latency stays in single-digit to low-double-digit milliseconds. The convergence
 gap in section 2 is therefore not a scheduling failure - pods are placed as fast as they arrive.
 The lag is in pod lifecycle transitions (KWOK's stages and deletion), not in placement.
+""")
 
-## 5. Control-plane cost concentrates rather than grows
+    parts.append(f"""## 5. Control-plane cost concentrates rather than grows
 
 CPU is measured from cAdvisor counters for the components that actually do work; the emulated pods
 themselves burn nothing.
 
-| Metric | 20x | 15x | 10x | 5x | 1x |
-|---|---|---|---|---|---|
-| kwok-controller mean (cores) | 0.0065 | 0.0079 | 0.0063 | 0.0059 | 0.0022 |
-| kwok-controller peak (cores) | 0.0277 | 0.0301 | 0.0284 | 0.0306 | 0.0112 |
-| kube-state-metrics mean (cores) | 0.0037 | 0.0043 | 0.0033 | 0.0030 | 0.0010 |
-| prometheus mean (cores) | 0.0205 | 0.0433 | 0.0435 | 0.0581 | 0.0298 |
-| coredns mean (cores) | 0.0013 | 0.0026 | 0.0021 | 0.0027 | 0.0011 |
-| control plane total mean (cores) | 0.0320 | 0.0582 | 0.0553 | 0.0698 | 0.0342 |
+{_table(summary, [
+    ("cpu_kwok-controller_mean_cores", "kwok-controller mean (cores)", 4),
+    ("cpu_kwok-controller_max_cores", "kwok-controller peak (cores)", 4),
+    ("cpu_kube-state-metrics_mean_cores", "kube-state-metrics mean (cores)", 4),
+    ("cpu_prometheus_mean_cores", "prometheus mean (cores)", 4),
+    ("cpu_coredns_mean_cores", "coredns mean (cores)", 4),
+    ("cpu_control_plane_total_mean_cores", "control plane total mean (cores)", 4),
+])}
 
 Compressing the trace 20x raises mean kwok-controller CPU only about
-3.0x, not
+{_fmt(fast['cpu_kwok-controller_mean_cores'] / slow['cpu_kwok-controller_mean_cores'], 1)}x, not
 20x, and the absolute numbers stay small - single-digit millicores on this cluster. The control
 plane had ample headroom at every speed, which is consistent with the scheduler never queuing.
 Acceleration on this workload is not CPU-bound; it is bound by pod lifecycle latency, which is a
 delay, not a throughput limit. That is why more CPU would not fix section 2.
+""")
 
-## 6. A measurement artifact worth fixing
+    parts.append("""## 6. A measurement artifact worth fixing
 
 Every run except the first opens with ~330s of samples that belong to the **previous** run. The
 collector queries a window starting `overlap` (300s) before the emulation, and the previous run's
@@ -193,19 +283,20 @@ runs 2-5 log 98 node creations plus 3 updates while the first run logs 101 creat
 Fixes, in order of preference: reset the cluster before the run *and* wait for the namespaces to
 be fully gone, or set the collector's `overlap` below the inter-run gap, or simply discard the
 first `overlap` seconds of every collection.
+""")
 
-## 7. What this means for running accelerated emulations
+    parts.append(f"""## 7. What this means for running accelerated emulations
 
 - **Pacing is not the risk.** KLUE issued the trace on time at 20x with R^2 = 1.0. If you only
   check that the run completed and the peaks are there, every speed looks fine.
 - **The risk is that the cluster lags and the metrics hide it.** At 20x the cluster matches the
-  requested state only 59% of the time, and
-  51% of the trace's states are never sampled.
+  requested state only {_fmt(fast['converged_samples_pct'], 0)}% of the time, and
+  {_fmt(fast['tick_states_missed_pct'], 0)}% of the trace's states are never sampled.
 - **Scale-down is the binding constraint**, not scale-up, not scheduling, not CPU. Pod deletion
   costs wall-clock time that acceleration does not shrink, so surplus pods accumulate
-  (15% at 20x).
+  ({_fmt(fast['pod_surplus_pct'], 0)}% at 20x).
 - **A defensible ceiling on this workload is around 5x**, where convergence is still
-  82% and sampling still
+  {_fmt(summary[summary.speed == 5].iloc[0]['converged_samples_pct'], 0)}% and sampling still
   clears two samples per tick. 10x and beyond trade measurable fidelity for wall-clock time.
 - **If you accelerate, scale the collector step too.** `Collector(step=30)` should become
   something like `step = max(1, 30 / speed_by)` to keep trace-time resolution constant; otherwise
@@ -245,3 +336,26 @@ Tables: `summary_by_speed.csv` (every metric), `spike_capture.csv` (per-spike de
   consistent enough across independent metrics to be safe; individual pairwise gaps are not.
 - Convergence at high speed is measured on sparse samples and is therefore a lower bound.
 - Karpenter and Cluster Autoscaler metrics are absent by design: the sweep ran with no provisioner.
+""")
+
+    report = "\n".join(parts)
+    with open(os.path.join(out_dir, "REPORT.md"), "w", encoding="utf-8") as f:
+        f.write(report)
+    return report
+
+
+def write_tables(summary, details, out_dir):
+    summary.to_csv(os.path.join(out_dir, "summary_by_speed.csv"), index=False)
+
+    spikes = pd.concat(
+        [d["spikes"].assign(label=label) for label, d in details.items() if not d["spikes"].empty],
+        ignore_index=True)
+    spikes.to_csv(os.path.join(out_dir, "spike_capture.csv"), index=False)
+
+    conv = pd.concat(
+        [d["convergence"].assign(label=label) for label, d in details.items()
+         if not d["convergence"].empty], ignore_index=True)
+    conv.to_csv(os.path.join(out_dir, "convergence_timeseries.csv"), index=False)
+
+    with open(os.path.join(out_dir, "summary_by_speed.json"), "w", encoding="utf-8") as f:
+        json.dump(json.loads(summary.to_json(orient="records")), f, indent=2)
